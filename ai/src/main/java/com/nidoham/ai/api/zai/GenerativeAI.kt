@@ -7,109 +7,162 @@ import ai.z.openapi.service.model.ChatMessageRole
 import ai.z.openapi.service.model.ChatThinking
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Pure API wrapper around the ZAI chat endpoint.
+ * Industrial-grade stateful wrapper for the ZAI Chat API.
  *
- * This class holds no conversation state of its own. The caller is
- * responsible for maintaining history and injecting it before each turn
- * via [setHistory]. [sendMessage] will never mutate the injected list.
+ * Manages conversation history and system instructions internally.
+ * This class is thread-safe.
  *
- * @param modelName The model identifier to use for completions.
- * @param apiKey    API key for the ZAI client.
+ * @property client The underlying ZAI network client.
+ * @property config Configuration parameters for the model.
  */
-class GenerativeAI(
-    private val modelName: String = "glm-4.5-flash",
-    private val apiKey: String,
+class GenerativeAI private constructor(
+    private val client: ZaiClient,
+    private val config: Config
 ) {
+    // Thread-safe storage for conversation history
+    private val historyRef: AtomicReference<List<ChatMessage>> = AtomicReference(emptyList())
 
-    private val client = ZaiClient.builder().ofZAI().apiKey(apiKey).build()
-
-    private var history: List<ChatMessage> = emptyList()
-    private var instructions: String = ""
+    // Thread-safe storage for system instructions
+    private val instructionsRef: AtomicReference<String> = AtomicReference("")
 
     /**
-     * Replaces the active history snapshot used for the next request.
+     * Represents the result of a chat completion request.
+     */
+    sealed class Result {
+        data class Success(val message: ChatMessage) : Result()
+        data class ApiError(val code: Int?, val message: String) : Result()
+        data class ExceptionError(val exception: Throwable) : Result()
+    }
+
+    /**
+     * Replaces the active conversation history.
+     * Thread-safe: Can be called from any thread.
      *
-     * The caller is expected to call this before every [sendMessage] turn,
-     * passing in their own up-to-date list. A defensive copy is taken so
-     * the caller's list and the internal snapshot are fully independent.
-     *
-     * @param history The conversation history to use for the next request.
+     * @param history The new list of messages representing the conversation context.
      */
     fun setHistory(history: List<ChatMessage>) {
-        this.history = history.toList()
-    }
-
-    /** Overrides the system-level prompt prepended to every request. */
-    fun setSystemInstructions(instructions: String) {
-        this.instructions = instructions
+        historyRef.set(history.toList()) // Defensive copy
     }
 
     /**
-     * Sends [userMessage] to the model and returns the assistant's reply.
+     * Sets the system-level prompt for the conversation.
+     * Thread-safe: Can be called from any thread.
      *
-     * The injected [history] is used as-is to build the request. No messages
-     * are appended internally — the caller must update their own list after
-     * receiving a successful result.
+     * @param instructions The system prompt text.
+     */
+    fun setSystemInstructions(instructions: String) {
+        instructionsRef.set(instructions)
+    }
+
+    /**
+     * Sends the user message to the model using the current history and instructions.
      *
      * @param userMessage The user's input text.
-     * @return [Result.success] wrapping the assistant [ChatMessage], or
-     *         [Result.failure] with the underlying exception.
+     * @return [Result] containing either the successful message or an error.
      */
-    suspend fun sendMessage(userMessage: String): Result<ChatMessage> =
-        withContext(Dispatchers.IO) {
-            try {
-                val userMsg = ChatMessage.builder()
-                    .role(ChatMessageRole.USER.value())
-                    .content(userMessage)
-                    .build()
+    suspend fun sendMessage(userMessage: String): Result = withContext(Dispatchers.IO) {
+        try {
+            // Capture current state atomically
+            val currentHistory = historyRef.get()
+            val currentInstructions = instructionsRef.get()
 
-                val messages = buildList {
-                    if (instructions.isNotEmpty()) {
-                        add(
-                            ChatMessage.builder()
-                                .role(ChatMessageRole.SYSTEM.value())
-                                .content(instructions)
-                                .build()
-                        )
-                    }
-                    addAll(history)
-                    add(userMsg)
+            val userMsg = ChatMessage.builder()
+                .role(ChatMessageRole.USER.value())
+                .content(userMessage)
+                .build()
+
+            val messages = buildList {
+                if (currentInstructions.isNotEmpty()) {
+                    add(
+                        ChatMessage.builder()
+                            .role(ChatMessageRole.SYSTEM.value())
+                            .content(currentInstructions)
+                            .build()
+                    )
                 }
-
-                val request = ChatCompletionCreateParams.builder()
-                    .model(modelName)
-                    .messages(messages)
-                    .thinking(ChatThinking.builder().type("enabled").build())
-                    .maxTokens(1024)
-                    .temperature(1F)
-                    .build()
-
-                val response = client.chat().createChatCompletion(request)
-
-                if (response.isSuccess) {
-                    Result.success(response.data.choices[0].message)
-                } else {
-                    Result.failure(Exception(response.msg))
-                }
-            } catch (e: Exception) {
-                Result.failure(e)
+                addAll(currentHistory)
+                add(userMsg)
             }
+
+            val request = ChatCompletionCreateParams.builder()
+                .model(config.modelName)
+                .messages(messages)
+                .apply {
+                    if (config.enableThinking) {
+                        thinking(ChatThinking.builder().type("enabled").build())
+                    }
+                }
+                .maxTokens(config.maxTokens)
+                .temperature(config.temperature)
+                .build()
+
+            val response = client.chat().createChatCompletion(request)
+
+            if (response.isSuccess) {
+                val choice = response.data.choices.firstOrNull()
+                if (choice != null) {
+                    Result.Success(choice.message)
+                } else {
+                    Result.ApiError(null, "No choices returned in successful response")
+                }
+            } else {
+                Result.ApiError(response.code, response.msg ?: "Unknown API Error")
+            }
+        } catch (e: Exception) {
+            Result.ExceptionError(e)
         }
+    }
+
+    /**
+     * Configuration data class for model parameters.
+     */
+    data class Config(
+        val modelName: String = "glm-4.5-flash",
+        val maxTokens: Int = 1024,
+        val temperature: Float = 1.0f,
+        val enableThinking: Boolean = true
+    )
 
     companion object {
+        /**
+         * Creates a GenerativeAI instance with an automatically configured client.
+         */
+        fun create(apiKey: String, config: Config = Config()): GenerativeAI {
+            require(apiKey.isNotBlank()) { "API Key cannot be blank." }
+            val client = ZaiClient.builder()
+                .ofZAI()
+                .apiKey(apiKey)
+                .build()
+            return GenerativeAI(client, config)
+        }
+
+        /**
+         * Creates a GenerativeAI instance with an externally provided client (Dependency Injection).
+         */
+        fun create(client: ZaiClient, config: Config = Config()): GenerativeAI {
+            return GenerativeAI(client, config)
+        }
+
+        // ***********************************************************
+        // Helper Methods
+        // ***********************************************************
 
         fun toContent(message: ChatMessage): String =
-            message.content?.toString() ?: "No response"
+            message.content?.toString()?.trim() ?: "No response"
 
         fun toThought(message: ChatMessage): String =
-            message.reasoningContent ?: "No response"
+            message.reasoningContent?.trim() ?: "No response"
 
         fun filterContent(content: String): String =
             content.removePrefix("AI Response:").trimStart()
 
-        fun toConversation(message: ChatMessage): String =
-            "**${toThought(message)}**: ${filterContent(toContent(message))}"
+        fun toConversation(message: ChatMessage): String {
+            val thought = toThought(message)
+            val content = filterContent(toContent(message))
+            return "**$thought**: $content"
+        }
     }
 }
