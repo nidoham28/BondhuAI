@@ -1,0 +1,20 @@
+[versions]
+agp = "9.2.0-alpha04"
+junit = "4.13.2"
+openaiJava = "4.29.0"
+runner = "1.0.2"
+espressoCoreVersion = "3.0.2"
+zaiSdk = "0.3.3"
+coroutines = "1.10.2"
+
+[libraries]
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+openai-java = { module = "com.openai:openai-java", version.ref = "openaiJava" }
+runner = { group = "com.android.support.test", name = "runner", version.ref = "runner" }
+espresso-core = { group = "com.android.support.test.espresso", name = "espresso-core", version.ref = "espressoCoreVersion" }
+zai-sdk = { module = "ai.z.openapi:zai-sdk", version.ref = "zaiSdk" }
+kotlinx-coroutines-android = { group = "org.jetbrains.kotlinx", name = "kotlinx-coroutines-android", version.ref = "coroutines" }
+
+[plugins]
+android-library = { id = "com.android.library", version.ref = "agp" }
+
