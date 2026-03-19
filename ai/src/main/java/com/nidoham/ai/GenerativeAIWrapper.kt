@@ -20,7 +20,7 @@ class GenerativeAIWrapper(
      *
      * Returns [Result.failure] when no provider is mapped.
      */
-    suspend fun sendMessage(userMessage: String): Result<String> {
+    suspend fun sendMessage(userMessage: String): Result<ChatMessage> {
         if (provider == Provider.GLM) {
             val delegate = GenerativeAI(modelName = modelName, apiKey = apiKey)
             delegate.setHistory(conversationHistory)
