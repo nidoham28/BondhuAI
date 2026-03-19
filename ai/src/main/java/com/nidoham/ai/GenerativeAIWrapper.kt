@@ -3,86 +3,77 @@ package com.nidoham.ai
 import ai.z.openapi.service.model.ChatMessage
 import ai.z.openapi.service.model.ChatMessageRole
 import com.nidoham.ai.api.zai.GenerativeAI
-import java.util.Collections
 
+/**
+ * Stateful wrapper around [GenerativeAI] that manages conversation history
+ * and syncs it to the delegate before each request.
+ *
+ * Thread-safe via an explicit lock on [history].
+ */
 class GenerativeAIWrapper(
-    private val provider: Provider,
-    private val apiKey: String,
-    private val modelName: String = "glm-4.5-flash",
+    provider: Provider,
+    apiKey: String,
+    modelName: String = "glm-4.5-flash",
 ) {
-
     enum class Provider { GLM, Unknown }
 
-    // Optimized: Initialize delegate once to reuse connection/resources
+    private val supported = provider == Provider.GLM
+
     private val delegate: GenerativeAI = GenerativeAI.create(
         apiKey = apiKey,
         config = GenerativeAI.Config(modelName = modelName)
     )
 
-    // Thread-safe history list
-    private val conversationHistory: MutableList<ChatMessage> =
-        Collections.synchronizedList(mutableListOf())
+    private val lock = Any()
+    private val history: MutableList<ChatMessage> = mutableListOf()
 
     /**
-     * Sends message if Provider is GLM.
-     * Shows "Coming Soon" Toast and returns failure otherwise.
+     * Sends a message if the provider is [Provider.GLM].
+     * Returns [Result.failure] with [UnsupportedOperationException] for all other providers.
      */
     suspend fun sendMessage(userMessage: String): Result<ChatMessage> {
-        if (provider == Provider.GLM) {
-            // 1. Sync history to the delegate
-            delegate.setHistory(conversationHistory.toList())
+        if (!supported) {
+            return Result.failure(UnsupportedOperationException("Provider is not supported yet."))
+        }
 
-            // 2. Execute request
-            val result = delegate.sendMessage(userMessage)
+        // Snapshot history atomically before handing off to the delegate
+        val snapshot = synchronized(lock) { history.toList() }
+        delegate.setHistory(snapshot)
 
-            // 3. Handle result
-            return when (result) {
-                is GenerativeAI.Result.Success -> {
-                    // Add User message
-                    conversationHistory.add(
-                        ChatMessage.builder()
-                            .role(ChatMessageRole.USER.value())
-                            .content(userMessage)
-                            .build()
-                    )
-                    // Add Assistant message
-                    conversationHistory.add(
-                        ChatMessage.builder()
-                            .role(ChatMessageRole.ASSISTANT.value())
-                            .content(result.message.content) // Extract content safely
-                            .build()
-                    )
-                    Result.success(result.message)
+        return when (val result = delegate.sendMessage(userMessage)) {
+            is GenerativeAI.Result.Success -> {
+                val userMsg = ChatMessage.builder()
+                    .role(ChatMessageRole.USER.value())
+                    .content(userMessage)
+                    .build()
+                val assistantMsg = ChatMessage.builder()
+                    .role(ChatMessageRole.ASSISTANT.value())
+                    .content(GenerativeAI.toContent(result.message))
+                    .build()
+                synchronized(lock) {
+                    history.add(userMsg)
+                    history.add(assistantMsg)
                 }
-                is GenerativeAI.Result.ApiError -> {
-                    Result.failure(Exception("API Error ${result.code}: ${result.message}"))
-                }
-                is GenerativeAI.Result.ExceptionError -> {
-                    Result.failure(result.exception)
-                }
+                Result.success(result.message)
             }
-        } else {
-            // Handle non-GLM providers
-            return Result.failure(UnsupportedOperationException("Provider $provider is not supported yet."))
+            is GenerativeAI.Result.ApiError ->
+                Result.failure(Exception("API Error ${result.code}: ${result.message}"))
+            is GenerativeAI.Result.ExceptionError ->
+                Result.failure(result.exception)
         }
     }
 
-    fun setHistory(history: List<ChatMessage>) {
-        synchronized(conversationHistory) {
-            conversationHistory.clear()
-            conversationHistory.addAll(history)
+    /** Replaces the entire conversation history. */
+    fun setHistory(newHistory: List<ChatMessage>) {
+        synchronized(lock) {
+            history.clear()
+            history.addAll(newHistory)
         }
     }
 
-    fun getHistory(): List<ChatMessage> {
-        return synchronized(conversationHistory) {
-            conversationHistory.toList()
-        }
-    }
+    /** Returns a snapshot of the current conversation history. */
+    fun getHistory(): List<ChatMessage> = synchronized(lock) { history.toList() }
 
-    fun resetContext() {
-        synchronized(conversationHistory) {
-            conversationHistory.clear()
-        }
-    }
+    /** Clears the conversation history. */
+    fun resetContext() = synchronized(lock) { history.clear() }
 }
