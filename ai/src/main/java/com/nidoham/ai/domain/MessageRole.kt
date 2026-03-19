@@ -1,11 +1,11 @@
 package com.nidoham.ai.domain
 
-enum class MessageRole(val values: String) {
+enum class MessageRole(val value: String) {
     USER("user"),
     ASSISTANT("assistant"),
     SYSTEM("system");
 
     companion object {
-        fun fromModelName(name: String): ModelType? = ModelType.entries.find { it.modelName == name }
+        fun fromValue(value: String): MessageRole? = entries.find { it.value == value }
     }
 }
